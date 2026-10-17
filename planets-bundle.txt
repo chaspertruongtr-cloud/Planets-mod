@@ -1,0 +1,1985 @@
+QUADRAVERSE planets mod - all project files in one file. Do not edit.
+=====FILE: README.md=====
+# Planets & Nations (Fabric, Minecraft 1.21.11)
+
+Server-side mod: players join with a **vanilla client**. It adds four bounded planets, player nations with chunk claims, a planet travel menu, planet resources and craftable guns.
+
+## Build
+
+Needs Java 21.
+
+```
+gradle wrapper        # once, creates ./gradlew
+./gradlew build       # jar ends up in build/libs/planets-1.0.0.jar
+```
+
+Put the jar and Fabric API (0.140.0+1.21.11) in the server's `mods` folder. If Gradle rejects the Loom or loader version, copy the current ones for 1.21.11 from https://fabricmc.net/develop/ into `gradle.properties`.
+
+This project could not be compiled where it was written, so expect to fix a few Minecraft API name mismatches on the first build (the source uses Mojang mappings).
+
+## Planets
+
+| Planet | Border | Terrain |
+|---|---|---|
+| Overworld | 8000 x 8000 | vanilla |
+| Frutiger Aero | 4000 x 4000 | bright meadows, floating glass water bubbles |
+| Dreamcore | 4000 x 4000 | flat sunflower plains, ball pits, block towers, swing sets, retro TVs, toy chests (items from 2000-2016) |
+| Autumn | 6000 x 6000 | tall birch forest, leaf litter and dead bushes, abandoned cabin settlements |
+
+Borders are centred on 0,0. Sizes live in `Planet.java`. The dimensions are defined in `data/planets/dimension/*.json`.
+
+## Travel
+
+Everyone gets a **Planet Compass**; right-click it to open the planet menu. Also: `/planets`, `/compass` (get a new one). Nation members get a "Nation home" button.
+
+## Nations
+
+`/nation create <name>`, `claim`, `unclaim`, `invite <player>`, `accept`, `leave`, `kick <player>`, `disband`, `sethome`, `home`, `info [name]`, `list`, `here`, `map`.
+
+A nation can claim 20 chunks plus 10 per extra member. Non-members cannot break, place or interact inside claimed chunks. Data is stored in `config/planets/nations.json`.
+
+## Resources and guns
+
+Planet resources are bonus drops from ores:
+
+- Overworld: Saltpeter (coal)
+- Frutiger Aero: Aero Crystal (lapis), Gloss Gel (emerald)
+- Dreamcore: Plastic Scrap (copper), Battery Cell (gold)
+- Autumn: Rusted Scrap (iron), Amber Resin (coal)
+
+Right-click a **smithing table** to open the gunsmith (sneak + right-click for the normal table). Guns: Revolver, Hunting Rifle, Aero Beam Rifle, Foam Blaster, Scrap Shotgun. Each needs its own ammo, so players are pushed to trade between planets. Stats are in `Gun.java`, costs in `Gunsmith.java`.
+
+## Known limits
+
+- Explosions (TNT, creepers) can still damage claims; add a mixin if you want that blocked.
+- Server operators have no claim bypass yet.
+- The planets use the vanilla Overworld dimension type, so there is no custom sky or fixed time. Biome choice carries the mood.
+- The vanilla world border is square, so each planet is one size x size square.
+=====FILE: build.gradle=====
+plugins {
+    id 'fabric-loom' version "${loom_version}"
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    // Official Mojang mappings (class names in the source follow these).
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": inputs.properties.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+    it.options.encoding = 'UTF-8'
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+=====FILE: gradle.properties=====
+org.gradle.jvmargs=-Xmx2G
+org.gradle.parallel=true
+
+# Fabric (Minecraft 1.21.11). If Loom or the loader version is rejected, copy the
+# current values from https://fabricmc.net/develop/ for 1.21.11.
+minecraft_version=1.21.11
+loader_version=0.18.1
+loom_version=1.14-SNAPSHOT
+fabric_version=0.140.0+1.21.11
+
+mod_version=1.0.0
+maven_group=com.planets
+archives_base_name=planets
+=====FILE: settings.gradle=====
+pluginManagement {
+    repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+rootProject.name = 'planets'
+=====FILE: src/main/java/com/planets/BlockEvents.java=====
+package com.planets;
+
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+
+/** Land protection, bonus ore drops, gunsmith table and item right-clicks. */
+public final class BlockEvents {
+    private BlockEvents() {}
+
+    public static void register() {
+        // Protection: breaking
+        PlayerBlockBreakEvents.BEFORE.register((level, player, pos, state, blockEntity) -> {
+            if (player instanceof ServerPlayer sp && level instanceof ServerLevel sl
+                    && !PlanetsMod.NATIONS.canBuild(sp, sl, pos)) {
+                PlanetsMod.NATIONS.deny(sp, sl, pos);
+                return false;
+            }
+            return true;
+        });
+
+        // Planet resources: bonus drops
+        PlayerBlockBreakEvents.AFTER.register((level, player, pos, state, blockEntity) -> {
+            if (!(player instanceof ServerPlayer sp) || !(level instanceof ServerLevel sl) || sp.isCreative()) return;
+            Planet planet = Planet.of(sl);
+            if (planet == null) return;
+            ItemStack extra = PlanetResources.extraDrop(planet, state, sl.getRandom());
+            if (extra != null) {
+                Block.popResource(sl, pos, extra);
+            }
+        });
+
+        // Right-click on a block: guns, compass, gunsmith table, then protection
+        UseBlockCallback.EVENT.register((player, level, hand, hit) -> {
+            if (!(player instanceof ServerPlayer sp) || !(level instanceof ServerLevel sl)) {
+                return InteractionResult.PASS;
+            }
+            if (ItemUse.handle(sp, sp.getItemInHand(hand))) {
+                return InteractionResult.SUCCESS;
+            }
+
+            BlockPos clicked = hit.getBlockPos();
+            BlockState state = sl.getBlockState(clicked);
+            if (state.is(Blocks.SMITHING_TABLE) && !sp.isShiftKeyDown()) {
+                Gunsmith.open(sp);
+                return InteractionResult.SUCCESS;
+            }
+
+            BlockPos placed = clicked.relative(hit.getDirection());
+            if (!PlanetsMod.NATIONS.canBuild(sp, sl, clicked)) {
+                PlanetsMod.NATIONS.deny(sp, sl, clicked);
+                return InteractionResult.FAIL;
+            }
+            if (!PlanetsMod.NATIONS.canBuild(sp, sl, placed)) {
+                PlanetsMod.NATIONS.deny(sp, sl, placed);
+                return InteractionResult.FAIL;
+            }
+            return InteractionResult.PASS;
+        });
+
+        // Right-click in the air
+        UseItemCallback.EVENT.register((player, level, hand) -> {
+            if (player instanceof ServerPlayer sp && ItemUse.handle(sp, sp.getItemInHand(hand))) {
+                return InteractionResult.SUCCESS;
+            }
+            return InteractionResult.PASS;
+        });
+    }
+}
+=====FILE: src/main/java/com/planets/ButtonMenu.java=====
+package com.planets;
+
+import java.util.function.BiConsumer;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.Container;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.inventory.ChestMenu;
+import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.inventory.MenuType;
+import net.minecraft.world.item.ItemStack;
+
+/** A chest-style GUI whose items are buttons. Items can never be taken out. */
+public class ButtonMenu extends ChestMenu {
+    private final int rows;
+    private final BiConsumer<ServerPlayer, Integer> handler;
+
+    public ButtonMenu(MenuType<?> type, int syncId, Inventory inv, Container container, int rows,
+                      BiConsumer<ServerPlayer, Integer> handler) {
+        super(type, syncId, inv, container, rows);
+        this.rows = rows;
+        this.handler = handler;
+    }
+
+    @Override
+    public void clicked(int slot, int button, ClickType type, Player player) {
+        if (slot >= 0 && slot < rows * 9 && type == ClickType.PICKUP && player instanceof ServerPlayer sp) {
+            handler.accept(sp, slot);
+        }
+        // Never call super: nothing may be moved. Resync so the client forgets any drag.
+        if (player.containerMenu == this) {
+            sendAllDataToRemote();
+        }
+    }
+
+    @Override
+    public ItemStack quickMoveStack(Player player, int index) {
+        return ItemStack.EMPTY;
+    }
+
+    @Override
+    public boolean stillValid(Player player) {
+        return true;
+    }
+
+    public static MenuType<?> typeFor(int rows) {
+        return switch (rows) {
+            case 1 -> MenuType.GENERIC_9x1;
+            case 2 -> MenuType.GENERIC_9x2;
+            case 3 -> MenuType.GENERIC_9x3;
+            case 4 -> MenuType.GENERIC_9x4;
+            case 5 -> MenuType.GENERIC_9x5;
+            default -> MenuType.GENERIC_9x6;
+        };
+    }
+}
+=====FILE: src/main/java/com/planets/Gun.java=====
+package com.planets;
+
+import net.minecraft.core.particles.ParticleOptions;
+import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundEvents;
+
+/** Hitscan weapon stats. Tweak freely. */
+public enum Gun {
+    //     item                          ammo                        dmg  pellets spread range cooldown knock particle                sound                                         pitch
+    REVOLVER(ModItems.Id.REVOLVER,         ModItems.Id.LIGHT_ROUNDS, 6.0f, 1, 0.01, 48, 14, 0.3, ParticleTypes.CRIT,    SoundEvents.FIREWORK_ROCKET_BLAST,       1.6f),
+    HUNTING_RIFLE(ModItems.Id.HUNTING_RIFLE, ModItems.Id.RIFLE_ROUNDS, 14.0f, 1, 0.0, 100, 35, 0.6, ParticleTypes.CRIT,  SoundEvents.FIREWORK_ROCKET_LARGE_BLAST, 1.2f),
+    AERO_BEAM_RIFLE(ModItems.Id.AERO_BEAM_RIFLE, ModItems.Id.AERO_CELLS, 9.0f, 1, 0.0, 80, 10, 0.1, ParticleTypes.END_ROD, SoundEvents.AMETHYST_BLOCK_RESONATE, 1.8f),
+    FOAM_BLASTER(ModItems.Id.FOAM_BLASTER, ModItems.Id.FOAM_DARTS,   2.0f, 1, 0.03, 30, 5, 0.9, ParticleTypes.CLOUD,   SoundEvents.SLIME_BLOCK_PLACE,           1.4f),
+    SCRAP_SHOTGUN(ModItems.Id.SCRAP_SHOTGUN, ModItems.Id.SCRAP_SHELLS, 3.0f, 7, 0.09, 16, 28, 0.7, ParticleTypes.SMOKE, SoundEvents.FIREWORK_ROCKET_LARGE_BLAST, 0.7f);
+
+    public final ModItems.Id item;
+    public final ModItems.Id ammo;
+    public final float damage;
+    public final int pellets;
+    public final double spread;
+    public final int range;
+    public final int cooldown;
+    public final double knockback;
+    public final ParticleOptions particle;
+    public final SoundEvent sound;
+    public final float pitch;
+
+    Gun(ModItems.Id item, ModItems.Id ammo, float damage, int pellets, double spread, int range,
+        int cooldown, double knockback, ParticleOptions particle, SoundEvent sound, float pitch) {
+        this.item = item;
+        this.ammo = ammo;
+        this.damage = damage;
+        this.pellets = pellets;
+        this.spread = spread;
+        this.range = range;
+        this.cooldown = cooldown;
+        this.knockback = knockback;
+        this.particle = particle;
+        this.sound = sound;
+        this.pitch = pitch;
+    }
+
+    public static Gun of(ModItems.Id id) {
+        for (Gun g : values()) {
+            if (g.item == id) return g;
+        }
+        return null;
+    }
+}
+=====FILE: src/main/java/com/planets/Gunsmith.java=====
+package com.planets;
+
+import java.util.ArrayList;
+import java.util.List;
+import net.minecraft.ChatFormatting;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.SimpleMenuProvider;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemLore;
+
+/**
+ * The gunsmith: right-click a smithing table (not sneaking) to craft ammo, guns and the compass.
+ * Done in code because vanilla recipes cannot require items with custom names.
+ */
+public final class Gunsmith {
+    private Gunsmith() {}
+
+    private record Req(Item vanilla, ModItems.Id custom, int n) {
+        static Req v(Item item, int n) { return new Req(item, null, n); }
+        static Req c(ModItems.Id id, int n) { return new Req(null, id, n); }
+
+        Component label() {
+            return custom != null ? Component.literal(custom.display) : new ItemStack(vanilla).getHoverName();
+        }
+    }
+
+    private record Recipe(ItemStack result, List<Req> cost) {}
+
+    private static List<Recipe> recipes;
+
+    private static List<Recipe> recipes() {
+        if (recipes == null) {
+            List<Recipe> r = new ArrayList<>();
+            // Ammo
+            r.add(new Recipe(ModItems.make(ModItems.Id.LIGHT_ROUNDS, 16),
+                    List.of(Req.v(Items.IRON_INGOT, 1), Req.v(Items.GUNPOWDER, 1), Req.c(ModItems.Id.SALTPETER, 1))));
+            r.add(new Recipe(ModItems.make(ModItems.Id.RIFLE_ROUNDS, 8),
+                    List.of(Req.v(Items.IRON_INGOT, 2), Req.v(Items.GUNPOWDER, 1), Req.c(ModItems.Id.SALTPETER, 2))));
+            r.add(new Recipe(ModItems.make(ModItems.Id.AERO_CELLS, 12),
+                    List.of(Req.c(ModItems.Id.AERO_CRYSTAL, 2), Req.c(ModItems.Id.GLOSS_GEL, 1))));
+            r.add(new Recipe(ModItems.make(ModItems.Id.FOAM_DARTS, 24),
+                    List.of(Req.c(ModItems.Id.PLASTIC_SCRAP, 3))));
+            r.add(new Recipe(ModItems.make(ModItems.Id.SCRAP_SHELLS, 8),
+                    List.of(Req.c(ModItems.Id.RUSTED_SCRAP, 4), Req.v(Items.GUNPOWDER, 1), Req.c(ModItems.Id.AMBER_RESIN, 1))));
+            // Guns
+            r.add(new Recipe(ModItems.make(ModItems.Id.REVOLVER, 1),
+                    List.of(Req.v(Items.IRON_INGOT, 8), Req.v(Items.COPPER_INGOT, 2), Req.v(Items.FLINT, 1))));
+            r.add(new Recipe(ModItems.make(ModItems.Id.HUNTING_RIFLE, 1),
+                    List.of(Req.v(Items.IRON_INGOT, 12), Req.v(Items.STICK, 6), Req.v(Items.DIAMOND, 1))));
+            r.add(new Recipe(ModItems.make(ModItems.Id.AERO_BEAM_RIFLE, 1),
+                    List.of(Req.c(ModItems.Id.AERO_CRYSTAL, 6), Req.c(ModItems.Id.GLOSS_GEL, 4),
+                            Req.v(Items.IRON_INGOT, 6), Req.v(Items.DIAMOND, 1))));
+            r.add(new Recipe(ModItems.make(ModItems.Id.FOAM_BLASTER, 1),
+                    List.of(Req.c(ModItems.Id.PLASTIC_SCRAP, 8), Req.c(ModItems.Id.BATTERY_CELL, 3), Req.v(Items.IRON_INGOT, 2))));
+            r.add(new Recipe(ModItems.make(ModItems.Id.SCRAP_SHOTGUN, 1),
+                    List.of(Req.c(ModItems.Id.RUSTED_SCRAP, 16), Req.c(ModItems.Id.AMBER_RESIN, 3), Req.v(Items.IRON_INGOT, 4))));
+            // Travel
+            r.add(new Recipe(ModItems.make(ModItems.Id.PLANET_COMPASS, 1),
+                    List.of(Req.v(Items.IRON_INGOT, 1), Req.v(Items.REDSTONE, 1))));
+            recipes = r;
+        }
+        return recipes;
+    }
+
+    private static final int FIRST_SLOT = 9;
+    private static final int INFO_SLOT = 31;
+
+    public static void open(ServerPlayer player) {
+        SimpleContainer container = new SimpleContainer(36);
+        render(player, container);
+        player.openMenu(new SimpleMenuProvider(
+                (syncId, inv, p) -> new ButtonMenu(ButtonMenu.typeFor(4), syncId, inv, container, 4,
+                        (sp, slot) -> onClick(sp, slot, container)),
+                Component.literal("Gunsmith")));
+    }
+
+    private static void onClick(ServerPlayer player, int slot, SimpleContainer container) {
+        int index = slot - FIRST_SLOT;
+        List<Recipe> list = recipes();
+        if (index < 0 || index >= list.size()) return;
+        Recipe recipe = list.get(index);
+
+        for (Req req : recipe.cost()) {
+            if (count(player, req) < req.n()) {
+                player.displayClientMessage(Component.literal("You are missing materials.").withStyle(ChatFormatting.RED), true);
+                return;
+            }
+        }
+        for (Req req : recipe.cost()) take(player, req);
+        player.getInventory().placeItemBackInInventory(recipe.result().copy());
+        player.playNotifySound(SoundEvents.ANVIL_USE, SoundSource.PLAYERS, 0.8f, 1.2f);
+        render(player, container);
+    }
+
+    private static void render(ServerPlayer player, SimpleContainer container) {
+        ItemStack filler = new ItemStack(Items.GRAY_STAINED_GLASS_PANE);
+        filler.set(DataComponents.CUSTOM_NAME, Component.literal(" "));
+        for (int i = 0; i < container.getContainerSize(); i++) container.setItem(i, filler.copy());
+
+        List<Recipe> list = recipes();
+        for (int i = 0; i < list.size(); i++) {
+            Recipe recipe = list.get(i);
+            ItemStack shown = recipe.result().copy();
+            List<Component> lore = new ArrayList<>();
+            ItemLore existing = shown.get(DataComponents.LORE);
+            if (existing != null) lore.addAll(existing.lines());
+            lore.add(ModItems.text("Cost:", ChatFormatting.WHITE));
+            boolean canCraft = true;
+            for (Req req : recipe.cost()) {
+                int have = count(player, req);
+                boolean enough = have >= req.n();
+                if (!enough) canCraft = false;
+                lore.add(Component.empty()
+                        .append(ModItems.text((enough ? "  ✔ " : "  ✘ ") + Math.min(have, 999) + "/" + req.n() + " ",
+                                enough ? ChatFormatting.GREEN : ChatFormatting.RED))
+                        .append(req.label().copy().withStyle(enough ? ChatFormatting.GREEN : ChatFormatting.RED)));
+            }
+            lore.add(ModItems.text(canCraft ? "Click to craft" : "Missing materials",
+                    canCraft ? ChatFormatting.GREEN : ChatFormatting.RED));
+            shown.set(DataComponents.LORE, new ItemLore(lore));
+            container.setItem(FIRST_SLOT + i, shown);
+        }
+
+        ItemStack info = new ItemStack(Items.SMITHING_TABLE);
+        info.set(DataComponents.CUSTOM_NAME, ModItems.text("Gunsmith", ChatFormatting.GOLD));
+        info.set(DataComponents.LORE, new ItemLore(List.of(
+                ModItems.text("Planet resources are bonus drops from ores:", ChatFormatting.GRAY),
+                ModItems.text("Overworld: Saltpeter  (coal)", ChatFormatting.GRAY),
+                ModItems.text("Frutiger Aero: Aero Crystal, Gloss Gel  (lapis, emerald)", ChatFormatting.GRAY),
+                ModItems.text("Dreamcore: Plastic Scrap, Battery Cell  (copper, gold)", ChatFormatting.GRAY),
+                ModItems.text("Autumn: Rusted Scrap, Amber Resin  (iron, coal)", ChatFormatting.GRAY),
+                ModItems.text("Sneak + right-click the table to use it normally.", ChatFormatting.DARK_GRAY))));
+        container.setItem(INFO_SLOT, info);
+    }
+
+    private static boolean matches(ItemStack s, Req req) {
+        if (s.isEmpty()) return false;
+        if (req.custom() != null) return ModItems.idOf(s) == req.custom();
+        return !ModItems.isModItem(s) && s.is(req.vanilla());
+    }
+
+    private static int count(ServerPlayer p, Req req) {
+        int total = 0;
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack s = inv.getItem(i);
+            if (matches(s, req)) total += s.getCount();
+        }
+        return total;
+    }
+
+    private static void take(ServerPlayer p, Req req) {
+        int left = req.n();
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < inv.getContainerSize() && left > 0; i++) {
+            ItemStack s = inv.getItem(i);
+            if (matches(s, req)) {
+                int t = Math.min(left, s.getCount());
+                s.shrink(t);
+                left -= t;
+            }
+        }
+    }
+}
+=====FILE: src/main/java/com/planets/ItemUse.java=====
+package com.planets;
+
+import net.minecraft.ChatFormatting;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.projectile.ProjectileUtil;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.EntityHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
+
+/** Right-click behaviour of the Planet Compass and the guns. */
+public final class ItemUse {
+    private ItemUse() {}
+
+    /** Returns true if the stack was one of ours and the click has been handled. */
+    public static boolean handle(ServerPlayer player, ItemStack stack) {
+        ModItems.Id id = ModItems.idOf(stack);
+        if (id == null) return false;
+        if (id == ModItems.Id.PLANET_COMPASS) {
+            PlanetTravel.openMenu(player);
+            return true;
+        }
+        Gun gun = Gun.of(id);
+        if (gun == null) return false;
+        fire(player, stack, gun);
+        return true;
+    }
+
+    private static void fire(ServerPlayer p, ItemStack stack, Gun gun) {
+        ServerLevel level = (ServerLevel) p.level();
+        if (p.getCooldowns().isOnCooldown(stack)) return;
+
+        if (!consumeAmmo(p, gun.ammo)) {
+            p.displayClientMessage(Component.literal("Out of " + gun.ammo.display + "!").withStyle(ChatFormatting.RED), true);
+            level.playSound(null, p.blockPosition(), SoundEvents.DISPENSER_FAIL, SoundSource.PLAYERS, 1.0f, 1.2f);
+            p.getCooldowns().addCooldown(stack, 8);
+            return;
+        }
+        p.getCooldowns().addCooldown(stack, gun.cooldown);
+        level.playSound(null, p.blockPosition(), gun.sound, SoundSource.PLAYERS, 1.2f, gun.pitch);
+
+        for (int i = 0; i < gun.pellets; i++) {
+            shoot(level, p, gun);
+        }
+    }
+
+    private static void shoot(ServerLevel level, ServerPlayer p, Gun gun) {
+        Vec3 eye = p.getEyePosition();
+        Vec3 dir = p.getLookAngle();
+        if (gun.spread > 0) {
+            RandomSource r = p.getRandom();
+            dir = dir.add((r.nextDouble() - 0.5) * 2 * gun.spread,
+                    (r.nextDouble() - 0.5) * 2 * gun.spread,
+                    (r.nextDouble() - 0.5) * 2 * gun.spread).normalize();
+        }
+
+        Vec3 end = eye.add(dir.scale(gun.range));
+        BlockHitResult blockHit = level.clip(new ClipContext(eye, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, p));
+        if (blockHit.getType() != HitResult.Type.MISS) {
+            end = blockHit.getLocation();
+        }
+
+        AABB box = new AABB(eye, end).inflate(1.0);
+        EntityHitResult entityHit = ProjectileUtil.getEntityHitResult(level, p, eye, end, box,
+                e -> !e.isSpectator() && e.isPickable() && e != p);
+        if (entityHit != null) {
+            end = entityHit.getLocation();
+            Entity target = entityHit.getEntity();
+            if (target instanceof LivingEntity living) {
+                boolean friendly = target instanceof ServerPlayer tp
+                        && PlanetsMod.NATIONS.sameNation(p.getUUID(), tp.getUUID());
+                if (!friendly) {
+                    living.hurtServer(level, level.damageSources().playerAttack(p), gun.damage);
+                    if (gun.knockback > 0) {
+                        living.knockback(gun.knockback, -dir.x, -dir.z);
+                    }
+                }
+            }
+        }
+
+        double dist = eye.distanceTo(end);
+        for (double d = 1.5; d < dist; d += 1.2) {
+            Vec3 pt = eye.add(dir.scale(d));
+            level.sendParticles(gun.particle, pt.x, pt.y, pt.z, 1, 0, 0, 0, 0);
+        }
+    }
+
+    private static boolean consumeAmmo(ServerPlayer p, ModItems.Id ammo) {
+        if (p.isCreative()) return true;
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack s = inv.getItem(i);
+            if (ModItems.idOf(s) == ammo) {
+                s.shrink(1);
+                return true;
+            }
+        }
+        return false;
+    }
+}
+=====FILE: src/main/java/com/planets/ModItems.java=====
+package com.planets;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import net.minecraft.ChatFormatting;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.Style;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.CustomData;
+import net.minecraft.world.item.component.ItemLore;
+
+/**
+ * Server-side "custom items": vanilla items with a custom name, lore and a hidden id.
+ * No registry entries are added, so vanilla clients can join.
+ */
+public final class ModItems {
+    private ModItems() {}
+
+    public enum Id {
+        // Resources
+        SALTPETER(Items.SUGAR, "Saltpeter", ChatFormatting.WHITE, false,
+                "Overworld resource", "Bonus drop from coal ore in the Overworld"),
+        AERO_CRYSTAL(Items.PRISMARINE_CRYSTALS, "Aero Crystal", ChatFormatting.AQUA, false,
+                "Frutiger Aero resource", "Bonus drop from lapis ore on Frutiger Aero"),
+        GLOSS_GEL(Items.SLIME_BALL, "Gloss Gel", ChatFormatting.GREEN, false,
+                "Frutiger Aero resource", "Bonus drop from emerald ore on Frutiger Aero"),
+        PLASTIC_SCRAP(Items.HONEYCOMB, "Plastic Scrap", ChatFormatting.LIGHT_PURPLE, false,
+                "Dreamcore resource", "Bonus drop from copper ore on Dreamcore"),
+        BATTERY_CELL(Items.GLOWSTONE_DUST, "Battery Cell", ChatFormatting.YELLOW, false,
+                "Dreamcore resource", "Bonus drop from gold ore on Dreamcore"),
+        RUSTED_SCRAP(Items.IRON_NUGGET, "Rusted Scrap", ChatFormatting.GOLD, false,
+                "Autumn resource", "Bonus drop from iron ore on the Autumn planet"),
+        AMBER_RESIN(Items.RESIN_CLUMP, "Amber Resin", ChatFormatting.GOLD, false,
+                "Autumn resource", "Bonus drop from coal ore on the Autumn planet"),
+
+        // Ammo
+        LIGHT_ROUNDS(Items.GOLD_NUGGET, "Light Rounds", ChatFormatting.YELLOW, false,
+                "Ammo for the Revolver"),
+        RIFLE_ROUNDS(Items.BRICK, "Rifle Rounds", ChatFormatting.RED, false,
+                "Ammo for the Hunting Rifle"),
+        AERO_CELLS(Items.PRISMARINE_SHARD, "Aero Cells", ChatFormatting.AQUA, false,
+                "Ammo for the Aero Beam Rifle"),
+        FOAM_DARTS(Items.ARROW, "Foam Darts", ChatFormatting.LIGHT_PURPLE, false,
+                "Ammo for the Foam Blaster"),
+        SCRAP_SHELLS(Items.NETHER_BRICK, "Scrap Shells", ChatFormatting.GOLD, false,
+                "Ammo for the Scrap Shotgun"),
+
+        // Guns
+        REVOLVER(Items.BLAZE_ROD, "Revolver", ChatFormatting.YELLOW, true,
+                "Reliable sidearm", "Ammo: Light Rounds"),
+        HUNTING_RIFLE(Items.CROSSBOW, "Hunting Rifle", ChatFormatting.RED, true,
+                "Slow, accurate, long range", "Ammo: Rifle Rounds"),
+        AERO_BEAM_RIFLE(Items.BREEZE_ROD, "Aero Beam Rifle", ChatFormatting.AQUA, true,
+                "Fast energy rifle", "Ammo: Aero Cells"),
+        FOAM_BLASTER(Items.BONE, "Foam Blaster", ChatFormatting.LIGHT_PURPLE, true,
+                "Weak but heavy knockback", "Ammo: Foam Darts"),
+        SCRAP_SHOTGUN(Items.STICK, "Scrap Shotgun", ChatFormatting.GOLD, true,
+                "Brutal at close range", "Ammo: Scrap Shells"),
+
+        // Travel
+        PLANET_COMPASS(Items.COMPASS, "Planet Compass", ChatFormatting.GREEN, false,
+                "Right-click to choose a planet");
+
+        public final Item base;
+        public final String display;
+        public final ChatFormatting color;
+        public final boolean gun;
+        public final String[] lore;
+
+        Id(Item base, String display, ChatFormatting color, boolean gun, String... lore) {
+            this.base = base;
+            this.display = display;
+            this.color = color;
+            this.gun = gun;
+            this.lore = lore;
+        }
+
+        public String key() {
+            return name().toLowerCase(Locale.ROOT);
+        }
+    }
+
+    private static final String TAG = "planets_id";
+    private static final Map<String, Id> BY_KEY = new HashMap<>();
+
+    static {
+        for (Id id : Id.values()) {
+            BY_KEY.put(id.key(), id);
+        }
+    }
+
+    public static Component text(String s, ChatFormatting color) {
+        return Component.literal(s).withStyle(Style.EMPTY.withItalic(false)).withStyle(color);
+    }
+
+    public static ItemStack make(Id id, int count) {
+        ItemStack stack = new ItemStack(id.base, count);
+        stack.set(DataComponents.CUSTOM_NAME, text(id.display, id.color));
+        List<Component> lore = new ArrayList<>();
+        for (String line : id.lore) {
+            lore.add(text(line, ChatFormatting.GRAY));
+        }
+        if (id.gun) {
+            lore.add(text("Right-click to fire", ChatFormatting.DARK_GRAY));
+            stack.set(DataComponents.MAX_STACK_SIZE, 1);
+        }
+        stack.set(DataComponents.LORE, new ItemLore(lore));
+        CompoundTag tag = new CompoundTag();
+        tag.putString(TAG, id.key());
+        stack.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
+        return stack;
+    }
+
+    /** A collectible toy for Dreamcore chests. */
+    public static ItemStack toy(String name, Item base, int year) {
+        ItemStack stack = new ItemStack(base, 1);
+        stack.set(DataComponents.CUSTOM_NAME, text(name, ChatFormatting.LIGHT_PURPLE));
+        List<Component> lore = new ArrayList<>();
+        lore.add(text("A keepsake from " + year, ChatFormatting.GRAY));
+        stack.set(DataComponents.LORE, new ItemLore(lore));
+        CompoundTag tag = new CompoundTag();
+        tag.putString(TAG, "toy");
+        stack.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
+        return stack;
+    }
+
+    /** The mod id of a stack, or null if it is not one of the mod's resource/ammo/gun/compass items. */
+    public static Id idOf(ItemStack stack) {
+        if (stack.isEmpty()) return null;
+        CustomData data = stack.get(DataComponents.CUSTOM_DATA);
+        if (data == null) return null;
+        return BY_KEY.get(data.copyTag().getStringOr(TAG, ""));
+    }
+
+    /** True for any stack carrying a mod tag (including toys), so vanilla recipes never count them. */
+    public static boolean isModItem(ItemStack stack) {
+        if (stack.isEmpty()) return false;
+        CustomData data = stack.get(DataComponents.CUSTOM_DATA);
+        return data != null && data.copyTag().contains(TAG);
+    }
+}
+=====FILE: src/main/java/com/planets/NationCommands.java=====
+package com.planets;
+
+import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Pattern;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.minecraft.ChatFormatting;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.Commands;
+import net.minecraft.commands.arguments.EntityArgument;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+
+public final class NationCommands {
+    private NationCommands() {}
+
+    private static final Pattern NAME = Pattern.compile("[A-Za-z0-9_]{3,16}");
+
+    public static void register() {
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+            registerNation(dispatcher);
+            dispatcher.register(Commands.literal("planets").executes(c -> {
+                PlanetTravel.openMenu(c.getSource().getPlayerOrException());
+                return 1;
+            }));
+            dispatcher.register(Commands.literal("compass").executes(c -> {
+                ServerPlayer p = c.getSource().getPlayerOrException();
+                p.getInventory().placeItemBackInInventory(ModItems.make(ModItems.Id.PLANET_COMPASS, 1));
+                return 1;
+            }));
+        });
+    }
+
+    private static void registerNation(CommandDispatcher<CommandSourceStack> d) {
+        d.register(Commands.literal("nation")
+                .then(Commands.literal("create")
+                        .then(Commands.argument("name", StringArgumentType.word()).executes(NationCommands::create)))
+                .then(Commands.literal("claim").executes(NationCommands::claim))
+                .then(Commands.literal("unclaim").executes(NationCommands::unclaim))
+                .then(Commands.literal("invite")
+                        .then(Commands.argument("player", EntityArgument.player()).executes(NationCommands::invite)))
+                .then(Commands.literal("accept").executes(NationCommands::accept))
+                .then(Commands.literal("leave").executes(NationCommands::leave))
+                .then(Commands.literal("kick")
+                        .then(Commands.argument("player", StringArgumentType.word()).executes(NationCommands::kick)))
+                .then(Commands.literal("disband").executes(NationCommands::disband))
+                .then(Commands.literal("sethome").executes(NationCommands::setHome))
+                .then(Commands.literal("home").executes(NationCommands::home))
+                .then(Commands.literal("info").executes(c -> info(c, null))
+                        .then(Commands.argument("name", StringArgumentType.word())
+                                .executes(c -> info(c, StringArgumentType.getString(c, "name")))))
+                .then(Commands.literal("list").executes(NationCommands::list))
+                .then(Commands.literal("here").executes(NationCommands::here))
+                .then(Commands.literal("map").executes(NationCommands::map)));
+    }
+
+    // ---- helpers ----
+
+    private static int fail(CommandContext<CommandSourceStack> c, String msg) {
+        c.getSource().sendFailure(Component.literal(msg));
+        return 0;
+    }
+
+    private static int ok(CommandContext<CommandSourceStack> c, String msg) {
+        c.getSource().sendSuccess(() -> Component.literal(msg).withStyle(ChatFormatting.GREEN), false);
+        return 1;
+    }
+
+    private static NationManager.Nation ownedBy(ServerPlayer p) {
+        NationManager.Nation n = PlanetsMod.NATIONS.byPlayer(p.getUUID());
+        return (n != null && n.owner.equals(p.getUUID().toString())) ? n : null;
+    }
+
+    private static String claimKeyHere(ServerPlayer p) {
+        Planet planet = Planet.of((ServerLevel) p.level());
+        if (planet == null) return null;
+        return NationManager.claimKey(planet.id, p.blockPosition().getX() >> 4, p.blockPosition().getZ() >> 4);
+    }
+
+    // ---- commands ----
+
+    private static int create(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        String name = StringArgumentType.getString(c, "name");
+        if (PlanetsMod.NATIONS.byPlayer(p.getUUID()) != null) return fail(c, "You are already in a nation. Leave it first.");
+        if (!NAME.matcher(name).matches()) return fail(c, "Names are 3-16 letters, digits or underscores.");
+        if (PlanetsMod.NATIONS.byName(name) != null) return fail(c, "That name is taken.");
+        PlanetsMod.NATIONS.create(name, p);
+        return ok(c, "Nation " + name + " founded! Stand in a chunk and use /nation claim.");
+    }
+
+    private static int claim(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        NationManager.Nation n = ownedBy(p);
+        if (n == null) return fail(c, "Only a nation owner can claim land. Use /nation create <name>.");
+        String key = claimKeyHere(p);
+        if (key == null) return fail(c, "Land can only be claimed on the four planets.");
+        String[] parts = key.split(":");
+        NationManager.Nation existing = PlanetsMod.NATIONS.claimAt(parts[0], Integer.parseInt(parts[1]), Integer.parseInt(parts[2]));
+        if (existing != null) return fail(c, "This chunk is already claimed by " + existing.name + ".");
+        int max = PlanetsMod.NATIONS.maxClaims(n);
+        if (n.claims.size() >= max) return fail(c, "Your nation reached its claim limit (" + max + "). Recruit members for more.");
+        PlanetsMod.NATIONS.addClaim(n, key);
+        return ok(c, "Chunk claimed (" + n.claims.size() + "/" + max + ").");
+    }
+
+    private static int unclaim(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        NationManager.Nation n = ownedBy(p);
+        if (n == null) return fail(c, "Only a nation owner can unclaim land.");
+        String key = claimKeyHere(p);
+        if (key == null || !n.claims.contains(key)) return fail(c, "This chunk is not yours.");
+        PlanetsMod.NATIONS.removeClaim(n, key);
+        return ok(c, "Chunk released.");
+    }
+
+    private static int invite(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        NationManager.Nation n = ownedBy(p);
+        if (n == null) return fail(c, "Only a nation owner can invite.");
+        ServerPlayer target = EntityArgument.getPlayer(c, "player");
+        if (PlanetsMod.NATIONS.byPlayer(target.getUUID()) != null) return fail(c, "That player is already in a nation.");
+        PlanetsMod.NATIONS.invites.put(target.getUUID(), n.name);
+        target.sendSystemMessage(Component.literal(p.getGameProfile().name() + " invited you to " + n.name
+                + ". Type /nation accept to join.").withStyle(ChatFormatting.GOLD));
+        return ok(c, "Invitation sent.");
+    }
+
+    private static int accept(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        String name = PlanetsMod.NATIONS.invites.remove(p.getUUID());
+        if (name == null) return fail(c, "You have no pending invitation.");
+        NationManager.Nation n = PlanetsMod.NATIONS.byName(name);
+        if (n == null) return fail(c, "That nation no longer exists.");
+        if (PlanetsMod.NATIONS.byPlayer(p.getUUID()) != null) return fail(c, "You are already in a nation.");
+        PlanetsMod.NATIONS.addMember(n, p.getUUID());
+        return ok(c, "You joined " + n.name + ".");
+    }
+
+    private static int leave(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        NationManager.Nation n = PlanetsMod.NATIONS.byPlayer(p.getUUID());
+        if (n == null) return fail(c, "You are not in a nation.");
+        if (n.owner.equals(p.getUUID().toString())) return fail(c, "Owners cannot leave. Use /nation disband.");
+        PlanetsMod.NATIONS.removeMember(n, p.getUUID().toString());
+        return ok(c, "You left " + n.name + ".");
+    }
+
+    private static int kick(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        NationManager.Nation n = ownedBy(p);
+        if (n == null) return fail(c, "Only a nation owner can kick members.");
+        String uuid = PlanetsMod.NATIONS.uuidByName(StringArgumentType.getString(c, "player"));
+        if (uuid == null || !n.members.contains(uuid)) return fail(c, "That player is not in your nation.");
+        if (uuid.equals(n.owner)) return fail(c, "You cannot kick yourself.");
+        PlanetsMod.NATIONS.removeMember(n, uuid);
+        return ok(c, "Member removed.");
+    }
+
+    private static int disband(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        NationManager.Nation n = ownedBy(p);
+        if (n == null) return fail(c, "Only a nation owner can disband it.");
+        PlanetsMod.NATIONS.disband(n);
+        return ok(c, "Nation " + n.name + " disbanded and all claims released.");
+    }
+
+    private static int setHome(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        NationManager.Nation n = ownedBy(p);
+        if (n == null) return fail(c, "Only a nation owner can set the home.");
+        String key = claimKeyHere(p);
+        if (key == null || !n.claims.contains(key)) return fail(c, "Stand inside one of your claimed chunks.");
+        n.homePlanet = key.split(":")[0];
+        n.hx = p.getX();
+        n.hy = p.getY();
+        n.hz = p.getZ();
+        PlanetsMod.NATIONS.save();
+        return ok(c, "Nation home set.");
+    }
+
+    private static int home(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        NationManager.Nation n = PlanetsMod.NATIONS.byPlayer(p.getUUID());
+        if (n == null) return fail(c, "You are not in a nation.");
+        if (n.homePlanet == null) return fail(c, "Your nation has no home yet (/nation sethome).");
+        PlanetTravel.goHome(p, n);
+        return 1;
+    }
+
+    private static int info(CommandContext<CommandSourceStack> c, String name) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        NationManager.Nation n = name == null ? PlanetsMod.NATIONS.byPlayer(p.getUUID()) : PlanetsMod.NATIONS.byName(name);
+        if (n == null) return fail(c, name == null ? "You are not in a nation." : "No such nation.");
+        List<String> members = new ArrayList<>();
+        for (String m : n.members) members.add(PlanetsMod.NATIONS.nameOf(m));
+        String home = n.homePlanet == null ? "none" : n.homePlanet + " (" + (int) n.hx + ", " + (int) n.hy + ", " + (int) n.hz + ")";
+        p.sendSystemMessage(Component.literal("== " + n.name + " ==").withStyle(ChatFormatting.GOLD));
+        p.sendSystemMessage(Component.literal("Owner: " + PlanetsMod.NATIONS.nameOf(n.owner)));
+        p.sendSystemMessage(Component.literal("Members (" + members.size() + "): " + String.join(", ", members)));
+        p.sendSystemMessage(Component.literal("Claims: " + n.claims.size() + "/" + PlanetsMod.NATIONS.maxClaims(n)));
+        p.sendSystemMessage(Component.literal("Home: " + home));
+        return 1;
+    }
+
+    private static int list(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        p.sendSystemMessage(Component.literal("== Nations ==").withStyle(ChatFormatting.GOLD));
+        boolean any = false;
+        for (NationManager.Nation n : PlanetsMod.NATIONS.all()) {
+            any = true;
+            p.sendSystemMessage(Component.literal(n.name + " - " + n.members.size() + " members, " + n.claims.size() + " chunks"));
+        }
+        if (!any) p.sendSystemMessage(Component.literal("No nations yet. Be the first: /nation create <name>"));
+        return 1;
+    }
+
+    private static int here(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        String key = claimKeyHere(p);
+        if (key == null) return fail(c, "Not on a planet.");
+        String[] parts = key.split(":");
+        NationManager.Nation n = PlanetsMod.NATIONS.claimAt(parts[0], Integer.parseInt(parts[1]), Integer.parseInt(parts[2]));
+        return ok(c, n == null ? "This chunk is unclaimed wilderness." : "This chunk belongs to " + n.name + ".");
+    }
+
+    private static int map(CommandContext<CommandSourceStack> c) throws CommandSyntaxException {
+        ServerPlayer p = c.getSource().getPlayerOrException();
+        Planet planet = Planet.of((ServerLevel) p.level());
+        if (planet == null) return fail(c, "Not on a planet.");
+        int pcx = p.blockPosition().getX() >> 4;
+        int pcz = p.blockPosition().getZ() >> 4;
+        NationManager.Nation mine = PlanetsMod.NATIONS.byPlayer(p.getUUID());
+        MutableComponent out = Component.literal("Claim map (north is up)  ").withStyle(ChatFormatting.GOLD)
+                .append(Component.literal("# yours ").withStyle(ChatFormatting.GREEN))
+                .append(Component.literal("# others ").withStyle(ChatFormatting.RED))
+                .append(Component.literal("# free ").withStyle(ChatFormatting.DARK_GRAY))
+                .append(Component.literal("+ you\n").withStyle(ChatFormatting.WHITE));
+        for (int dz = -4; dz <= 4; dz++) {
+            for (int dx = -6; dx <= 6; dx++) {
+                NationManager.Nation n = PlanetsMod.NATIONS.claimAt(planet.id, pcx + dx, pcz + dz);
+                ChatFormatting col = n == null ? ChatFormatting.DARK_GRAY : (n == mine ? ChatFormatting.GREEN : ChatFormatting.RED);
+                String ch = (dx == 0 && dz == 0) ? "+" : "#";
+                if (dx == 0 && dz == 0) col = ChatFormatting.WHITE;
+                out.append(Component.literal(ch).withStyle(col));
+            }
+            out.append(Component.literal("\n"));
+        }
+        p.sendSystemMessage(out);
+        return 1;
+    }
+}
+=====FILE: src/main/java/com/planets/NationManager.java=====
+package com.planets;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.ChatFormatting;
+import net.minecraft.core.BlockPos;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+
+/** Nations, members and chunk claims. Saved to config/planets/nations.json. */
+public class NationManager {
+    public static final int BASE_CLAIMS = 20;
+    public static final int CLAIMS_PER_EXTRA_MEMBER = 10;
+
+    public static class Nation {
+        public String name;
+        public String owner;
+        public Set<String> members = new LinkedHashSet<>();
+        public Set<String> claims = new LinkedHashSet<>();
+        public String homePlanet;
+        public double hx;
+        public double hy;
+        public double hz;
+    }
+
+    private static class Data {
+        Map<String, Nation> nations = new LinkedHashMap<>();
+        Map<String, String> names = new HashMap<>(); // uuid -> last known name
+    }
+
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+    private Data data = new Data();
+    private final Map<String, String> claimIndex = new HashMap<>();  // claim key -> nation key
+    private final Map<String, String> memberIndex = new HashMap<>(); // uuid -> nation key
+    public final Map<UUID, String> invites = new HashMap<>();        // invited player -> nation key
+    private Path file;
+
+    public void load() {
+        file = FabricLoader.getInstance().getConfigDir().resolve("planets/nations.json");
+        try {
+            if (Files.exists(file)) {
+                Data loaded = GSON.fromJson(Files.readString(file), Data.class);
+                if (loaded != null) data = loaded;
+            }
+        } catch (Exception e) {
+            PlanetsMod.LOGGER.error("Could not read nations.json", e);
+        }
+        reindex();
+    }
+
+    public void save() {
+        try {
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, GSON.toJson(data));
+        } catch (Exception e) {
+            PlanetsMod.LOGGER.error("Could not write nations.json", e);
+        }
+    }
+
+    private void reindex() {
+        claimIndex.clear();
+        memberIndex.clear();
+        for (Map.Entry<String, Nation> e : data.nations.entrySet()) {
+            for (String c : e.getValue().claims) claimIndex.put(c, e.getKey());
+            for (String m : e.getValue().members) memberIndex.put(m, e.getKey());
+        }
+    }
+
+    // ---- lookups ----
+
+    public static String claimKey(String planetId, int cx, int cz) {
+        return planetId + ":" + cx + ":" + cz;
+    }
+
+    public Nation byName(String name) {
+        return data.nations.get(name.toLowerCase(Locale.ROOT));
+    }
+
+    public Nation byPlayer(UUID uuid) {
+        String key = memberIndex.get(uuid.toString());
+        return key == null ? null : data.nations.get(key);
+    }
+
+    public Nation claimAt(String planetId, int cx, int cz) {
+        String key = claimIndex.get(claimKey(planetId, cx, cz));
+        return key == null ? null : data.nations.get(key);
+    }
+
+    public Iterable<Nation> all() {
+        return data.nations.values();
+    }
+
+    public boolean sameNation(UUID a, UUID b) {
+        Nation n = byPlayer(a);
+        return n != null && n.members.contains(b.toString());
+    }
+
+    public int maxClaims(Nation n) {
+        return BASE_CLAIMS + CLAIMS_PER_EXTRA_MEMBER * Math.max(0, n.members.size() - 1);
+    }
+
+    public void remember(ServerPlayer p) {
+        data.names.put(p.getUUID().toString(), p.getGameProfile().name());
+        save();
+    }
+
+    public String nameOf(String uuid) {
+        return data.names.getOrDefault(uuid, uuid.substring(0, 8));
+    }
+
+    public String uuidByName(String name) {
+        for (Map.Entry<String, String> e : data.names.entrySet()) {
+            if (e.getValue().equalsIgnoreCase(name)) return e.getKey();
+        }
+        return null;
+    }
+
+    // ---- changes ----
+
+    public Nation create(String name, ServerPlayer owner) {
+        Nation n = new Nation();
+        n.name = name;
+        n.owner = owner.getUUID().toString();
+        n.members.add(n.owner);
+        data.nations.put(name.toLowerCase(Locale.ROOT), n);
+        reindex();
+        save();
+        return n;
+    }
+
+    public void disband(Nation n) {
+        data.nations.remove(n.name.toLowerCase(Locale.ROOT));
+        invites.values().removeIf(v -> v.equalsIgnoreCase(n.name));
+        reindex();
+        save();
+    }
+
+    public void addMember(Nation n, UUID uuid) {
+        n.members.add(uuid.toString());
+        reindex();
+        save();
+    }
+
+    public void removeMember(Nation n, String uuid) {
+        n.members.remove(uuid);
+        reindex();
+        save();
+    }
+
+    public void addClaim(Nation n, String key) {
+        n.claims.add(key);
+        claimIndex.put(key, n.name.toLowerCase(Locale.ROOT));
+        save();
+    }
+
+    public void removeClaim(Nation n, String key) {
+        n.claims.remove(key);
+        claimIndex.remove(key);
+        save();
+    }
+
+    // ---- protection ----
+
+    public boolean canBuild(ServerPlayer p, ServerLevel level, BlockPos pos) {
+        Planet planet = Planet.of(level);
+        if (planet == null) return true;
+        Nation n = claimAt(planet.id, pos.getX() >> 4, pos.getZ() >> 4);
+        return n == null || n.members.contains(p.getUUID().toString());
+    }
+
+    public void deny(ServerPlayer p, ServerLevel level, BlockPos pos) {
+        Planet planet = Planet.of(level);
+        Nation n = planet == null ? null : claimAt(planet.id, pos.getX() >> 4, pos.getZ() >> 4);
+        String who = n == null ? "another nation" : n.name;
+        p.displayClientMessage(Component.literal("This land belongs to " + who + ".")
+                .withStyle(ChatFormatting.RED), true);
+    }
+}
+=====FILE: src/main/java/com/planets/Planet.java=====
+package com.planets;
+
+import net.minecraft.ChatFormatting;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Items;
+
+/**
+ * The four planets. {@code size} is the full width of the (square) world border, centred on 0,0.
+ * Change the numbers here to resize a planet.
+ */
+public enum Planet {
+    OVERWORLD("overworld", "Overworld", 8000, Items.GRASS_BLOCK, ChatFormatting.GREEN,
+            "The normal world.", "Iron, coal and Saltpeter (from coal ore)."),
+    FRUTIGER_AERO("frutiger_aero", "Frutiger Aero", 4000, Items.HEART_OF_THE_SEA, ChatFormatting.AQUA,
+            "Glossy meadows, floating glass bubbles.", "Aero Crystal and Gloss Gel (lapis / emerald ore)."),
+    DREAMCORE("dreamcore", "Dreamcore", 4000, Items.CAKE, ChatFormatting.LIGHT_PURPLE,
+            "Endless flat nostalgia: toys and tech from 2000-2016.", "Plastic Scrap and Battery Cells (copper / gold ore)."),
+    AUTUMN("autumn", "Autumn", 6000, Items.PUMPKIN, ChatFormatting.GOLD,
+            "Dead leaves, tall trees, abandoned settlements.", "Rusted Scrap and Amber Resin (iron / coal ore).");
+
+    public final String id;
+    public final String display;
+    public final int size;
+    public final Item icon;
+    public final ChatFormatting color;
+    public final String tagline;
+    public final String resources;
+
+    Planet(String id, String display, int size, Item icon, ChatFormatting color, String tagline, String resources) {
+        this.id = id;
+        this.display = display;
+        this.size = size;
+        this.icon = icon;
+        this.color = color;
+        this.tagline = tagline;
+        this.resources = resources;
+    }
+
+    /** Which planet a level is, or null for the Nether, the End or anything else. */
+    public static Planet of(ServerLevel level) {
+        // Matching on the dimension key's text keeps this independent of
+        // identifier class renames between Minecraft versions.
+        String key = level.dimension().toString();
+        if (key.contains("minecraft:overworld")) return OVERWORLD;
+        for (Planet p : values()) {
+            if (p != OVERWORLD && key.contains("planets:" + p.id)) return p;
+        }
+        return null;
+    }
+
+    public ServerLevel level(MinecraftServer server) {
+        for (ServerLevel l : server.getAllLevels()) {
+            if (of(l) == this) return l;
+        }
+        return null;
+    }
+
+    public static Planet byId(String id) {
+        for (Planet p : values()) {
+            if (p.id.equals(id)) return p;
+        }
+        return null;
+    }
+}
+=====FILE: src/main/java/com/planets/PlanetBorders.java=====
+package com.planets;
+
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.border.WorldBorder;
+
+public final class PlanetBorders {
+    private PlanetBorders() {}
+
+    public static void apply(MinecraftServer server) {
+        // The Overworld goes first: vanilla copies Overworld border changes to the other
+        // levels, so the planets must be set afterwards.
+        set(server.overworld(), Planet.OVERWORLD);
+        for (ServerLevel level : server.getAllLevels()) {
+            Planet planet = Planet.of(level);
+            if (planet != null && planet != Planet.OVERWORLD) {
+                set(level, planet);
+            }
+        }
+    }
+
+    private static void set(ServerLevel level, Planet planet) {
+        WorldBorder border = level.getWorldBorder();
+        border.setCenter(0, 0);
+        border.setSize(planet.size);
+        PlanetsMod.LOGGER.info("Border for {}: {}x{}", planet.display, planet.size, planet.size);
+    }
+}
+=====FILE: src/main/java/com/planets/PlanetDecorator.java=====
+package com.planets;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import java.lang.reflect.Type;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.levelgen.Heightmap;
+
+/**
+ * Adds planet flavour to chunks the first time a player is near them: extra ores, Dreamcore toys and
+ * playgrounds, Frutiger Aero glass bubbles, Autumn leaf litter and abandoned cabins.
+ * Everything stays inside the chunk it is generated for, so it never touches unloaded chunks.
+ * Chunks that were already decorated are remembered in config/planets/decorated.json.
+ */
+public final class PlanetDecorator {
+    private PlanetDecorator() {}
+
+    private static final Gson GSON = new Gson();
+    private static final Map<String, Set<Long>> DONE = new HashMap<>();
+    private static Path file;
+
+    public static void load() {
+        file = FabricLoader.getInstance().getConfigDir().resolve("planets/decorated.json");
+        try {
+            if (Files.exists(file)) {
+                Type type = new TypeToken<Map<String, Set<Long>>>() {}.getType();
+                Map<String, Set<Long>> loaded = GSON.fromJson(Files.readString(file), type);
+                if (loaded != null) DONE.putAll(loaded);
+            }
+        } catch (Exception e) {
+            PlanetsMod.LOGGER.error("Could not read decorated.json", e);
+        }
+    }
+
+    public static void save() {
+        try {
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, GSON.toJson(DONE));
+        } catch (Exception e) {
+            PlanetsMod.LOGGER.error("Could not write decorated.json", e);
+        }
+    }
+
+    public static void tick(MinecraftServer server) {
+        if (server.getTickCount() % 10 != 0) return;
+        int budget = 3; // chunks per pass, keeps the server smooth
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (budget <= 0) return;
+            ServerLevel level = (ServerLevel) player.level();
+            Planet planet = Planet.of(level);
+            if (planet == null || planet == Planet.OVERWORLD) continue;
+            Set<Long> done = DONE.computeIfAbsent(planet.id, k -> new HashSet<>());
+            int pcx = player.blockPosition().getX() >> 4;
+            int pcz = player.blockPosition().getZ() >> 4;
+            for (int dx = -5; dx <= 5 && budget > 0; dx++) {
+                for (int dz = -5; dz <= 5 && budget > 0; dz++) {
+                    int cx = pcx + dx;
+                    int cz = pcz + dz;
+                    long key = ChunkPos.asLong(cx, cz);
+                    if (done.contains(key)) continue;
+                    LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
+                    if (chunk == null) continue;
+                    done.add(key);
+                    decorate(level, planet, cx, cz);
+                    budget--;
+                }
+            }
+        }
+    }
+
+    private static void decorate(ServerLevel level, Planet planet, int cx, int cz) {
+        RandomSource rng = RandomSource.create(level.getSeed() * 341873128712L
+                + cx * 132897987541L + cz * 42317861L + planet.ordinal());
+        switch (planet) {
+            case FRUTIGER_AERO -> {
+                ores(level, rng, cx, cz, new Block[] {Blocks.LAPIS_ORE, Blocks.EMERALD_ORE}, 5);
+                if (rng.nextInt(14) == 0) bubble(level, rng, cx, cz);
+            }
+            case DREAMCORE -> dreamcore(level, rng, cx, cz);
+            case AUTUMN -> autumn(level, rng, cx, cz);
+            default -> { }
+        }
+    }
+
+    // ---------- helpers ----------
+
+    private static int surface(ServerLevel level, int x, int z) {
+        return level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+    }
+
+    private static void set(ServerLevel level, int x, int y, int z, Block block) {
+        level.setBlock(new BlockPos(x, y, z), block.defaultBlockState(), 2);
+    }
+
+    private static <T> T pick(RandomSource rng, T[] array) {
+        return array[rng.nextInt(array.length)];
+    }
+
+    private static void ores(ServerLevel level, RandomSource rng, int cx, int cz, Block[] ores, int attemptsEach) {
+        int minY = level.getMinY();
+        for (Block ore : ores) {
+            for (int a = 0; a < attemptsEach; a++) {
+                int x = cx * 16 + rng.nextInt(16);
+                int z = cz * 16 + rng.nextInt(16);
+                int top = Math.max(minY + 10, surface(level, x, z) - 6);
+                int y = minY + 4 + rng.nextInt(Math.max(1, top - (minY + 4)));
+                int size = 1 + rng.nextInt(4);
+                BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(x, y, z);
+                for (int i = 0; i < size; i++) {
+                    if ((pos.getX() >> 4) == cx && (pos.getZ() >> 4) == cz) {
+                        BlockState st = level.getBlockState(pos);
+                        if (st.is(BlockTags.BASE_STONE_OVERWORLD)) {
+                            level.setBlock(pos, ore.defaultBlockState(), 2);
+                        }
+                    }
+                    pos.move(rng.nextInt(3) - 1, rng.nextInt(3) - 1, rng.nextInt(3) - 1);
+                }
+            }
+        }
+    }
+
+    // ---------- Frutiger Aero ----------
+
+    private static final Block[] GLASS = {
+        Blocks.LIGHT_BLUE_STAINED_GLASS, Blocks.CYAN_STAINED_GLASS, Blocks.LIME_STAINED_GLASS, Blocks.WHITE_STAINED_GLASS
+    };
+
+    /** A floating glass bubble with water inside and a sea lantern glowing at the bottom. */
+    private static void bubble(ServerLevel level, RandomSource rng, int cx, int cz) {
+        int x = cx * 16 + 5 + rng.nextInt(6);
+        int z = cz * 16 + 5 + rng.nextInt(6);
+        int r = 3 + rng.nextInt(3);
+        int y = Math.min(surface(level, x, z) + 22 + rng.nextInt(40), level.getMaxY() - 10);
+        Block glass = pick(rng, GLASS);
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    int d2 = dx * dx + dy * dy + dz * dz;
+                    if (d2 > r * r) continue;
+                    if (d2 >= (r - 1) * (r - 1)) {
+                        set(level, x + dx, y + dy, z + dz, glass);
+                    } else if (dy < 0) {
+                        set(level, x + dx, y + dy, z + dz, Blocks.WATER);
+                    }
+                }
+            }
+        }
+        set(level, x, y - 1, z, Blocks.SEA_LANTERN);
+    }
+
+    // ---------- Dreamcore ----------
+
+    private static final Block[] WOOLS = {
+        Blocks.RED_WOOL, Blocks.YELLOW_WOOL, Blocks.BLUE_WOOL, Blocks.GREEN_WOOL,
+        Blocks.ORANGE_WOOL, Blocks.PINK_WOOL, Blocks.LIGHT_BLUE_WOOL, Blocks.LIME_WOOL
+    };
+    private static final Block[] CONCRETES = {
+        Blocks.RED_CONCRETE, Blocks.YELLOW_CONCRETE, Blocks.BLUE_CONCRETE, Blocks.GREEN_CONCRETE,
+        Blocks.ORANGE_CONCRETE, Blocks.PINK_CONCRETE, Blocks.CYAN_CONCRETE, Blocks.PURPLE_CONCRETE
+    };
+
+    private static final String[] TOY_NAMES = {
+        "Handheld Console", "Virtual Pet", "VHS Tape", "Flip Phone", "Rubber Duck",
+        "Slap Bracelet", "Loom Bands", "Fidget Spinner", "Cassette Tape", "Pog Collection"
+    };
+    private static final Item[] TOY_ITEMS = {
+        Items.CLOCK, Items.EGG, Items.BLACK_DYE, Items.COPPER_INGOT, Items.YELLOW_DYE,
+        Items.LEAD, Items.STRING, Items.HEART_OF_THE_SEA, Items.MUSIC_DISC_CAT, Items.HONEYCOMB
+    };
+    private static final int[] TOY_YEARS = {2004, 2001, 2002, 2006, 2000, 2003, 2014, 2016, 2005, 2000};
+
+    private static void dreamcore(ServerLevel level, RandomSource rng, int cx, int cz) {
+        ores(level, rng, cx, cz, new Block[] {Blocks.COPPER_ORE, Blocks.GOLD_ORE, Blocks.IRON_ORE, Blocks.COAL_ORE}, 6);
+        int bx = cx * 16;
+        int bz = cz * 16;
+        if (rng.nextInt(18) == 0) ballPit(level, rng, bx + 4 + rng.nextInt(8), bz + 4 + rng.nextInt(8));
+        if (rng.nextInt(14) == 0) blockTower(level, rng, bx + 4 + rng.nextInt(8), bz + 4 + rng.nextInt(8));
+        if (rng.nextInt(20) == 0) swingSet(level, bx + 4 + rng.nextInt(8), bz + 4 + rng.nextInt(8));
+        if (rng.nextInt(25) == 0) retroTv(level, bx + 4 + rng.nextInt(8), bz + 4 + rng.nextInt(8));
+        if (rng.nextInt(10) == 0) toyChest(level, rng, bx + 2 + rng.nextInt(12), bz + 2 + rng.nextInt(12));
+    }
+
+    private static void ballPit(ServerLevel level, RandomSource rng, int x, int z) {
+        int y = surface(level, x, z);
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                boolean edge = Math.abs(dx) == 3 || Math.abs(dz) == 3;
+                if (edge) {
+                    set(level, x + dx, y, z + dz, Blocks.WHITE_CONCRETE);
+                    set(level, x + dx, y - 1, z + dz, Blocks.WHITE_CONCRETE);
+                } else {
+                    set(level, x + dx, y - 1, z + dz, pick(rng, WOOLS));
+                    set(level, x + dx, y - 2, z + dz, pick(rng, WOOLS));
+                    set(level, x + dx, y, z + dz, Blocks.AIR);
+                }
+            }
+        }
+    }
+
+    private static void blockTower(ServerLevel level, RandomSource rng, int x, int z) {
+        int y = surface(level, x, z);
+        int h = 5 + rng.nextInt(8);
+        for (int dy = 0; dy < h; dy++) {
+            for (int dx = 0; dx < 2; dx++) {
+                for (int dz = 0; dz < 2; dz++) {
+                    set(level, x + dx, y + dy, z + dz, pick(rng, CONCRETES));
+                }
+            }
+        }
+    }
+
+    private static void swingSet(ServerLevel level, int x, int z) {
+        int y = surface(level, x, z);
+        for (int dy = 0; dy < 4; dy++) {
+            set(level, x - 2, y + dy, z, Blocks.OAK_FENCE);
+            set(level, x + 2, y + dy, z, Blocks.OAK_FENCE);
+        }
+        for (int dx = -2; dx <= 2; dx++) {
+            set(level, x + dx, y + 4, z, Blocks.OAK_PLANKS);
+        }
+        for (int side = -1; side <= 1; side += 2) {
+            set(level, x + side, y + 3, z, Blocks.OAK_FENCE);
+            set(level, x + side, y + 2, z, Blocks.OAK_FENCE);
+            set(level, x + side, y + 1, z, Blocks.OAK_SLAB);
+        }
+    }
+
+    private static void retroTv(ServerLevel level, int x, int z) {
+        int y = surface(level, x, z);
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dy = 0; dy < 4; dy++) {
+                boolean frame = Math.abs(dx) == 2 || dy == 0 || dy == 3;
+                set(level, x + dx, y + dy, z, frame ? Blocks.BLACK_CONCRETE : Blocks.SEA_LANTERN);
+            }
+        }
+        set(level, x - 1, y + 4, z, Blocks.END_ROD);
+        set(level, x + 1, y + 4, z, Blocks.END_ROD);
+        set(level, x + 1, y + 5, z, Blocks.END_ROD);
+    }
+
+    private static void toyChest(ServerLevel level, RandomSource rng, int x, int z) {
+        BlockPos pos = new BlockPos(x, surface(level, x, z), z);
+        level.setBlock(pos, Blocks.BARREL.defaultBlockState(), 3);
+        if (level.getBlockEntity(pos) instanceof Container chest) {
+            int toys = 3 + rng.nextInt(4);
+            for (int i = 0; i < toys; i++) {
+                int t = rng.nextInt(TOY_NAMES.length);
+                chest.setItem(rng.nextInt(chest.getContainerSize()), ModItems.toy(TOY_NAMES[t], TOY_ITEMS[t], TOY_YEARS[t]));
+            }
+            if (rng.nextInt(10) < 4) {
+                ModItems.Id res = rng.nextBoolean() ? ModItems.Id.PLASTIC_SCRAP : ModItems.Id.BATTERY_CELL;
+                chest.setItem(rng.nextInt(chest.getContainerSize()), ModItems.make(res, 1 + rng.nextInt(3)));
+            }
+        }
+    }
+
+    // ---------- Autumn ----------
+
+    private static void autumn(ServerLevel level, RandomSource rng, int cx, int cz) {
+        int bx = cx * 16;
+        int bz = cz * 16;
+
+        // Dead leaves and bushes on the ground
+        for (int x = 0; x < 16; x++) {
+            for (int z = 0; z < 16; z++) {
+                if (rng.nextFloat() > 0.4f) continue;
+                int wx = bx + x;
+                int wz = bz + z;
+                int y = surface(level, wx, wz);
+                BlockPos ground = new BlockPos(wx, y - 1, wz);
+                BlockState below = level.getBlockState(ground);
+                if (below.is(Blocks.GRASS_BLOCK) || below.is(Blocks.PODZOL) || below.is(Blocks.DIRT)) {
+                    BlockPos above = ground.above();
+                    if (level.getBlockState(above).isAir()) {
+                        Block deco = rng.nextInt(12) == 0 ? Blocks.DEAD_BUSH : Blocks.LEAF_LITTER;
+                        level.setBlock(above, deco.defaultBlockState(), 2);
+                    }
+                }
+            }
+        }
+
+        // Settlements: some 6x6-chunk regions hold an old village around a centre chunk
+        int rx = Math.floorDiv(cx, 6);
+        int rz = Math.floorDiv(cz, 6);
+        RandomSource region = RandomSource.create(level.getSeed() ^ (rx * 73856093L) ^ (rz * 19349663L));
+        boolean village = region.nextInt(2) == 0;
+        int centreX = rx * 6 + region.nextInt(6);
+        int centreZ = rz * 6 + region.nextInt(6);
+        double chance = (village && Math.abs(cx - centreX) <= 1 && Math.abs(cz - centreZ) <= 1) ? 0.7 : 0.012;
+        if (rng.nextDouble() < chance) {
+            cabin(level, rng, cx, cz);
+        }
+    }
+
+    private static void cabin(ServerLevel level, RandomSource rng, int cx, int cz) {
+        int ox = cx * 16 + 2 + rng.nextInt(6);
+        int oz = cz * 16 + 2 + rng.nextInt(6);
+        int y = surface(level, ox + 3, oz + 3);
+        if (!level.getFluidState(new BlockPos(ox + 3, y - 1, oz + 3)).isEmpty()) return;
+
+        for (int dx = 0; dx <= 6; dx++) {
+            for (int dz = 0; dz <= 6; dz++) {
+                int x = ox + dx;
+                int z = oz + dz;
+                // foundation
+                for (int yy = y - 2; yy >= y - 5; yy--) {
+                    BlockPos p = new BlockPos(x, yy, z);
+                    BlockState s = level.getBlockState(p);
+                    if (s.isAir() || s.canBeReplaced()) {
+                        level.setBlock(p, Blocks.COBBLESTONE.defaultBlockState(), 2);
+                    }
+                }
+                // floor
+                set(level, x, y - 1, z, rng.nextInt(3) == 0 ? Blocks.MOSSY_COBBLESTONE : Blocks.SPRUCE_PLANKS);
+                // clear the space above
+                for (int dy = 0; dy <= 6; dy++) {
+                    set(level, x, y + dy, z, Blocks.AIR);
+                }
+                boolean perimeter = dx == 0 || dx == 6 || dz == 0 || dz == 6;
+                boolean corner = (dx == 0 || dx == 6) && (dz == 0 || dz == 6);
+                if (perimeter) {
+                    for (int dy = 0; dy <= 3; dy++) {
+                        if (dx == 3 && dz == 0 && dy < 2) continue; // doorway
+                        if (corner) {
+                            set(level, x, y + dy, z, Blocks.SPRUCE_LOG);
+                        } else if (rng.nextInt(4) == 0) {
+                            if (rng.nextInt(2) == 0) set(level, x, y + dy, z, Blocks.COBWEB);
+                        } else {
+                            set(level, x, y + dy, z, rng.nextInt(5) == 0 ? Blocks.MOSSY_COBBLESTONE : Blocks.SPRUCE_PLANKS);
+                        }
+                    }
+                } else if (rng.nextInt(5) < 2) {
+                    set(level, x, y, z, Blocks.LEAF_LITTER);
+                }
+                // patchy roof
+                if (rng.nextInt(10) < 6) {
+                    set(level, x, y + 4, z, Blocks.SPRUCE_SLAB);
+                }
+            }
+        }
+
+        if (rng.nextInt(4) != 0) {
+            BlockPos pos = new BlockPos(ox + 5, y, oz + 5);
+            level.setBlock(pos, Blocks.BARREL.defaultBlockState(), 3);
+            if (level.getBlockEntity(pos) instanceof Container chest) {
+                int n = 2 + rng.nextInt(4);
+                for (int i = 0; i < n; i++) {
+                    int slot = rng.nextInt(chest.getContainerSize());
+                    switch (rng.nextInt(5)) {
+                        case 0 -> chest.setItem(slot, ModItems.make(ModItems.Id.RUSTED_SCRAP, 2 + rng.nextInt(5)));
+                        case 1 -> chest.setItem(slot, ModItems.make(ModItems.Id.AMBER_RESIN, 1 + rng.nextInt(3)));
+                        case 2 -> chest.setItem(slot, ModItems.make(ModItems.Id.SALTPETER, 1 + rng.nextInt(2)));
+                        case 3 -> chest.setItem(slot, new net.minecraft.world.item.ItemStack(Items.IRON_INGOT, 1 + rng.nextInt(3)));
+                        default -> chest.setItem(slot, new net.minecraft.world.item.ItemStack(Items.PUMPKIN_PIE, 1 + rng.nextInt(2)));
+                    }
+                }
+            }
+        }
+    }
+}
+=====FILE: src/main/java/com/planets/PlanetResources.java=====
+package com.planets;
+
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.Blocks;
+
+/** Which ores give which planet-specific resource, on top of their normal drops. */
+public final class PlanetResources {
+    private PlanetResources() {}
+
+    private static boolean isCoal(BlockState s) {
+        return s.is(Blocks.COAL_ORE) || s.is(Blocks.DEEPSLATE_COAL_ORE);
+    }
+
+    private static boolean isIron(BlockState s) {
+        return s.is(Blocks.IRON_ORE) || s.is(Blocks.DEEPSLATE_IRON_ORE);
+    }
+
+    private static boolean isLapis(BlockState s) {
+        return s.is(Blocks.LAPIS_ORE) || s.is(Blocks.DEEPSLATE_LAPIS_ORE);
+    }
+
+    private static boolean isEmerald(BlockState s) {
+        return s.is(Blocks.EMERALD_ORE) || s.is(Blocks.DEEPSLATE_EMERALD_ORE);
+    }
+
+    private static boolean isCopper(BlockState s) {
+        return s.is(Blocks.COPPER_ORE) || s.is(Blocks.DEEPSLATE_COPPER_ORE);
+    }
+
+    private static boolean isGold(BlockState s) {
+        return s.is(Blocks.GOLD_ORE) || s.is(Blocks.DEEPSLATE_GOLD_ORE);
+    }
+
+    /** The bonus drop for breaking {@code state} on {@code planet}, or null. */
+    public static ItemStack extraDrop(Planet planet, BlockState state, RandomSource r) {
+        switch (planet) {
+            case OVERWORLD:
+                if (isCoal(state) && r.nextFloat() < 0.6f) {
+                    return ModItems.make(ModItems.Id.SALTPETER, 1 + r.nextInt(2));
+                }
+                break;
+            case FRUTIGER_AERO:
+                if (isLapis(state)) return ModItems.make(ModItems.Id.AERO_CRYSTAL, 2 + r.nextInt(3));
+                if (isEmerald(state)) return ModItems.make(ModItems.Id.GLOSS_GEL, 1 + r.nextInt(2));
+                break;
+            case DREAMCORE:
+                if (isCopper(state)) return ModItems.make(ModItems.Id.PLASTIC_SCRAP, 2 + r.nextInt(3));
+                if (isGold(state)) return ModItems.make(ModItems.Id.BATTERY_CELL, 1 + r.nextInt(2));
+                break;
+            case AUTUMN:
+                if (isIron(state)) return ModItems.make(ModItems.Id.RUSTED_SCRAP, 2 + r.nextInt(4));
+                if (isCoal(state)) return ModItems.make(ModItems.Id.AMBER_RESIN, 1 + r.nextInt(3));
+                break;
+            default:
+                break;
+        }
+        return null;
+    }
+}
+=====FILE: src/main/java/com/planets/PlanetTravel.java=====
+package com.planets;
+
+import java.util.List;
+import java.util.Set;
+import net.minecraft.ChatFormatting;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.SimpleMenuProvider;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.component.ItemLore;
+import net.minecraft.world.level.levelgen.Heightmap;
+
+public final class PlanetTravel {
+    private PlanetTravel() {}
+
+    private static final int[] PLANET_SLOTS = {10, 12, 14, 16};
+    private static final int HOME_SLOT = 22;
+
+    public static void openMenu(ServerPlayer player) {
+        SimpleContainer container = new SimpleContainer(27);
+
+        ItemStack filler = new ItemStack(Items.GRAY_STAINED_GLASS_PANE);
+        filler.set(DataComponents.CUSTOM_NAME, Component.literal(" "));
+        for (int i = 0; i < 27; i++) container.setItem(i, filler.copy());
+
+        Planet[] planets = Planet.values();
+        for (int i = 0; i < planets.length; i++) {
+            Planet p = planets[i];
+            ItemStack icon = new ItemStack(p.icon);
+            icon.set(DataComponents.CUSTOM_NAME, ModItems.text(p.display, p.color));
+            icon.set(DataComponents.LORE, new ItemLore(List.of(
+                    ModItems.text(p.tagline, ChatFormatting.GRAY),
+                    ModItems.text("Size: " + p.size + " x " + p.size + " blocks", ChatFormatting.DARK_GRAY),
+                    ModItems.text("Resources: " + p.resources, ChatFormatting.DARK_GRAY),
+                    ModItems.text("Click to travel", ChatFormatting.GREEN))));
+            container.setItem(PLANET_SLOTS[i], icon);
+        }
+
+        NationManager.Nation nation = PlanetsMod.NATIONS.byPlayer(player.getUUID());
+        if (nation != null && nation.homePlanet != null) {
+            ItemStack home = new ItemStack(Items.RED_BED);
+            home.set(DataComponents.CUSTOM_NAME, ModItems.text("Nation home: " + nation.name, ChatFormatting.RED));
+            home.set(DataComponents.LORE, new ItemLore(List.of(
+                    ModItems.text("Travel to your nation's home point", ChatFormatting.GRAY),
+                    ModItems.text("Click to travel", ChatFormatting.GREEN))));
+            container.setItem(HOME_SLOT, home);
+        }
+
+        player.openMenu(new SimpleMenuProvider(
+                (syncId, inv, p) -> new ButtonMenu(ButtonMenu.typeFor(3), syncId, inv, container, 3,
+                        (sp, slot) -> onClick(sp, slot)),
+                Component.literal("Choose a planet")));
+    }
+
+    private static void onClick(ServerPlayer player, int slot) {
+        for (int i = 0; i < PLANET_SLOTS.length; i++) {
+            if (PLANET_SLOTS[i] == slot) {
+                travel(player, Planet.values()[i]);
+                return;
+            }
+        }
+        if (slot == HOME_SLOT) {
+            NationManager.Nation nation = PlanetsMod.NATIONS.byPlayer(player.getUUID());
+            if (nation != null && nation.homePlanet != null) {
+                goHome(player, nation);
+            }
+        }
+    }
+
+    public static void goHome(ServerPlayer player, NationManager.Nation nation) {
+        Planet planet = Planet.byId(nation.homePlanet);
+        ServerLevel level = planet == null ? null : planet.level(PlanetsMod.server);
+        if (level == null) {
+            player.sendSystemMessage(Component.literal("Your nation's home world is not available.")
+                    .withStyle(ChatFormatting.RED));
+            return;
+        }
+        player.closeContainer();
+        teleport(player, level, nation.hx, nation.hy, nation.hz);
+        player.sendSystemMessage(Component.literal("Welcome home to " + nation.name + ".")
+                .withStyle(ChatFormatting.GREEN));
+    }
+
+    public static void travel(ServerPlayer player, Planet target) {
+        MinecraftServer server = PlanetsMod.server;
+        ServerLevel dest = target.level(server);
+        if (dest == null) {
+            player.sendSystemMessage(Component.literal(target.display + " is not loaded. Is the planets data pack active?")
+                    .withStyle(ChatFormatting.RED));
+            return;
+        }
+        player.closeContainer();
+        BlockPos spot = findSpot(dest);
+        teleport(player, dest, spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5);
+        player.sendSystemMessage(Component.literal("Arrived on " + target.display + ".").withStyle(target.color));
+    }
+
+    public static void teleport(ServerPlayer player, ServerLevel level, double x, double y, double z) {
+        player.teleportTo(level, x, y, z, Set.of(), player.getYRot(), player.getXRot(), true);
+    }
+
+    /** Looks for dry, open ground near the middle of a planet. */
+    private static BlockPos findSpot(ServerLevel level) {
+        RandomSource random = RandomSource.create();
+        for (int i = 0; i < 40; i++) {
+            int range = 16 + i * 10;
+            int x = random.nextInt(range * 2 + 1) - range;
+            int z = random.nextInt(range * 2 + 1) - range;
+            level.getChunk(x >> 4, z >> 4); // make sure it is loaded
+            int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+            BlockPos below = new BlockPos(x, y - 1, z);
+            if (level.getFluidState(below).isEmpty()
+                    && level.getFluidState(below.above()).isEmpty()
+                    && !level.getBlockState(below).is(BlockTags.LEAVES)) {
+                return new BlockPos(x, y, z);
+            }
+        }
+        level.getChunk(0, 0);
+        return new BlockPos(0, level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, 0, 0), 0);
+    }
+}
+=====FILE: src/main/java/com/planets/PlanetsMod.java=====
+package com.planets;
+
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class PlanetsMod implements ModInitializer {
+    public static final String MOD_ID = "planets";
+    public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
+    public static final NationManager NATIONS = new NationManager();
+
+    /** Set once the server has started. */
+    public static MinecraftServer server;
+
+    private static final String COMPASS_TAG = "planets_compass_given";
+
+    @Override
+    public void onInitialize() {
+        NATIONS.load();
+        PlanetDecorator.load();
+
+        ServerLifecycleEvents.SERVER_STARTED.register(s -> {
+            server = s;
+            PlanetBorders.apply(s);
+        });
+
+        ServerLifecycleEvents.SERVER_STOPPING.register(s -> {
+            NATIONS.save();
+            PlanetDecorator.save();
+        });
+
+        ServerTickEvents.END_SERVER_TICK.register(s -> {
+            PlanetDecorator.tick(s);
+            if (s.getTickCount() % 6000 == 0) {
+                PlanetDecorator.save();
+            }
+        });
+
+        ServerPlayConnectionEvents.JOIN.register((handler, sender, s) -> {
+            ServerPlayer player = handler.getPlayer();
+            NATIONS.remember(player);
+            if (!player.getTags().contains(COMPASS_TAG)) {
+                player.addTag(COMPASS_TAG);
+                player.getInventory().placeItemBackInInventory(ModItems.make(ModItems.Id.PLANET_COMPASS, 1));
+            }
+        });
+
+        NationCommands.register();
+        BlockEvents.register();
+        LOGGER.info("Planets & Nations loaded.");
+    }
+}
+=====FILE: src/main/resources/data/planets/dimension/autumn.json=====
+{
+  "type": "minecraft:overworld",
+  "generator": {
+    "type": "minecraft:noise",
+    "settings": "minecraft:overworld",
+    "biome_source": {
+      "type": "minecraft:fixed",
+      "biome": "minecraft:old_growth_birch_forest"
+    }
+  }
+}
+=====FILE: src/main/resources/data/planets/dimension/dreamcore.json=====
+{
+  "type": "minecraft:overworld",
+  "generator": {
+    "type": "minecraft:flat",
+    "settings": {
+      "biome": "minecraft:sunflower_plains",
+      "features": false,
+      "lakes": false,
+      "layers": [
+        { "block": "minecraft:bedrock", "height": 1 },
+        { "block": "minecraft:stone", "height": 120 },
+        { "block": "minecraft:dirt", "height": 3 },
+        { "block": "minecraft:grass_block", "height": 1 }
+      ],
+      "structure_overrides": []
+    }
+  }
+}
+=====FILE: src/main/resources/data/planets/dimension/frutiger_aero.json=====
+{
+  "type": "minecraft:overworld",
+  "generator": {
+    "type": "minecraft:noise",
+    "settings": "minecraft:overworld",
+    "biome_source": {
+      "type": "minecraft:fixed",
+      "biome": "minecraft:meadow"
+    }
+  }
+}
+=====FILE: src/main/resources/fabric.mod.json=====
+{
+  "schemaVersion": 1,
+  "id": "planets",
+  "version": "${version}",
+  "name": "Planets & Nations",
+  "description": "Four bounded planets, player nations with chunk claims, a planet travel menu and craftable guns. Server-side only: vanilla clients can join.",
+  "authors": ["Server Owner"],
+  "license": "MIT",
+  "environment": "server",
+  "entrypoints": {
+    "main": ["com.planets.PlanetsMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
