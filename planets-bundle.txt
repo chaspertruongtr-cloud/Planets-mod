@@ -408,7 +408,7 @@ public final class Gunsmith {
         }
         for (Req req : recipe.cost()) take(player, req);
         player.getInventory().placeItemBackInInventory(recipe.result().copy());
-        player.playNotifySound(SoundEvents.ANVIL_USE, SoundSource.PLAYERS, 0.8f, 1.2f);
+        player.level().playSound(null, player.blockPosition(), SoundEvents.ANVIL_USE, SoundSource.PLAYERS, 0.8f, 1.2f);
         render(player, container);
     }
 
@@ -557,8 +557,8 @@ public final class ItemUse {
         }
 
         AABB box = new AABB(eye, end).inflate(1.0);
-        EntityHitResult entityHit = ProjectileUtil.getEntityHitResult(level, p, eye, end, box,
-                e -> !e.isSpectator() && e.isPickable() && e != p);
+        EntityHitResult entityHit = ProjectileUtil.getEntityHitResult(p, eye, end, box,
+                e -> !e.isSpectator() && e.isPickable() && e != p, eye.distanceToSqr(end));
         if (entityHit != null) {
             end = entityHit.getLocation();
             Entity target = entityHit.getEntity();
